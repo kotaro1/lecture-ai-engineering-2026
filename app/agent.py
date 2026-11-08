@@ -20,7 +20,12 @@ from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
-from pydantic_ai.messages import ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import (
+    DeferredToolRequests,
+    DeferredToolResults,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.providers.google import GoogleProvider
@@ -37,12 +42,13 @@ INSTRUCTIONS = """\
 - 宿題の答えそのものは書かず、考え方のヒントで導く。
 """
 
-# モデルは実行時に渡す（テストではAPIを呼ばない TestModel に差し替えるため）
-agent = Agent(instructions=INSTRUCTIONS)
+agent = Agent(instructions=INSTRUCTIONS, output_type=str | DeferredToolRequests)
 agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
 
 # TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
+agent.tool_plain(tools.make_quiz)
+agent.tool_plain(tools.save_learning_log, requires_approval=True)
 
 # 第5回: 使う MCP サーバーの設定ファイル。Claude Desktop や Cursor と同じ "mcpServers" 形式
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
@@ -128,7 +134,21 @@ def main() -> None:
     if args.mcp:
         print("[tools] MCP サーバー（app/mcp_servers.json）")
     try:
-        result = target.run_sync(args.question, model=build_model())
+        model = build_model()
+        result = target.run_sync(args.question, model=model)
+        if isinstance(result.output, DeferredToolRequests):
+            approvals = {}
+            for call in result.output.approvals:
+                print(f"承認が必要です: {call.tool_name}({call.args})")
+                answer = input("この処理を許可しますか？ [y/N]: ").strip().lower()
+                approvals[call.tool_call_id] = answer in {"y", "yes"}
+            if approvals:
+                result = target.run_sync(
+                    None,
+                    model=model,
+                    message_history=result.all_messages(),
+                    deferred_tool_results=DeferredToolResults(approvals=approvals),
+                )
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
